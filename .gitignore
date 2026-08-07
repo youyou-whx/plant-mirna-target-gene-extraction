@@ -1,0 +1,14 @@
+# Ignore everything by default
+*
+
+# Whitelist project files
+!.gitignore
+!extract_mirna_genes.py
+!llm_review.py
+!normalize_names.py
+!auto_update_lists.py
+!app.py
+!README.md
+!requirements.txt
+!.streamlit/
+!.streamlit/config.toml
