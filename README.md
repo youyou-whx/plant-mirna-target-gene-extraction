@@ -9,7 +9,7 @@ This pipeline processes a batch of PubMed abstracts and produces a curated, dedu
 ```
 ┌─────────────────────┐     ┌──────────────────────┐     ┌──────────────────────┐
 │  extract_mirna_     │───▶│     llm_review.py    │───▶│  normalize_names.py  │
-│  genes.py           │     │  (DeepSeek API)      │     │ (dedup + standardize)│
+│  genes.py           │     │                      │     │ (dedup + standardize)│
 │  regex extraction   │     │  verify/filter pairs │     │                      │
 └─────────┬───────────┘     └──────────┬───────────┘     └──────────┬───────────┘
           │                            │                            │
