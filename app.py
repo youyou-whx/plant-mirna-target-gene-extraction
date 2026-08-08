@@ -320,21 +320,33 @@ if run_norm and input_for_norm:
                 m_changed += 1
 
         deduped = norm.deduplicate(pairs)
-        output_path = os.path.join(SCRIPT_DIR, "miRNA-Target_Gene_Pairs_Final.xlsx")
-        norm.export_excel(pairs, deduped, output_path)
-        with open(output_path, "rb") as f:
-            st.session_state.final_excel_bytes = f.read()
 
-        if uploaded_reviewed:
-            os.unlink(input_for_norm)
+    with st.spinner("Resolving gene IDs (ricedata.cn / NCBI)..."):
+        gene_map = {}
+        gene_resolved = 0
+        gene_total = 0
+        try:
+            gene_map = norm.resolve_gene_ids(deduped)
+            gene_total = len(gene_map)
+            gene_resolved = sum(1 for v in gene_map.values() if v.get("RAP") or v.get("NCBI"))
+        except Exception:
+            st.warning("Gene ID resolution failed (network issue). IDs will be empty.")
 
-        st.session_state.final_excel_path = output_path
-        st.session_state.final_pairs = deduped
-        st.session_state.dedup_stats = {
-            "before": len(pairs), "after": len(deduped),
-            "miRNA_changed": m_changed,
-            "multi_pmid": sum(1 for d in deduped if d["pmid_count"] >= 2),
-        }
+    output_path = os.path.join(SCRIPT_DIR, "miRNA-Target_Gene_Pairs_Final.xlsx")
+    norm.export_excel(pairs, deduped, gene_map, gene_resolved, gene_total, input_for_norm, output_path)
+    with open(output_path, "rb") as f:
+        st.session_state.final_excel_bytes = f.read()
+
+    if uploaded_reviewed:
+        os.unlink(input_for_norm)
+
+    st.session_state.final_excel_path = output_path
+    st.session_state.final_pairs = deduped
+    st.session_state.dedup_stats = {
+        "before": len(pairs), "after": len(deduped),
+        "miRNA_changed": m_changed,
+        "multi_pmid": sum(1 for d in deduped if d["pmid_count"] >= 2),
+    }
 
     st.success(f"Done — {len(pairs)} entries → {len(deduped)} groups "
                f"({m_changed} miRNA names normalized)")
