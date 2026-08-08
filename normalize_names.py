@@ -1,19 +1,20 @@
 """
-miRNA / Gene Name Normalization & Deduplication
+miRNA Normalization, Deduplication & Gene ID Resolution
 
 Input:  LLM-reviewed Excel (or regex extraction Excel)
-Output: Normalized & deduplicated Excel
+Output: Normalized, deduplicated Excel with gene database IDs (RAP, MSU, NCBI)
 
 Usage:
     python normalize_names.py [input_file.xlsx]
-
-Default input: abstract-ricemirna-set_miRNA-Target_Gene_Pairs_LLMReviewed.xlsx
-               (falls back to abstract-ricemirna-set_miRNA-Target_Gene_Pairs.xlsx)
 """
 
 import re
 import sys
 import os
+import time
+import urllib.request
+import urllib.parse
+import urllib.error
 from collections import defaultdict
 
 try:
@@ -385,6 +386,139 @@ def deduplicate(pairs):
 
 
 # ============================================================
+# Gene ID Resolution (ricedata.cn for rice, NCBI E-utils for others)
+# ============================================================
+
+RICEDATA_URL = "https://www.ricedata.cn/gene/accessions_switch.aspx"
+NCBI_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+
+# Common name → NCBI organism name
+_NCBI_ORGANISM = {
+    "rice": "Oryza sativa", "wheat": "Triticum aestivum",
+    "maize": "Zea mays", "Arabidopsis": "Arabidopsis thaliana",
+    "soybean": "Glycine max", "barley": "Hordeum vulgare",
+    "sorghum": "Sorghum bicolor", "tomato": "Solanum lycopersicum",
+    "potato": "Solanum tuberosum", "tobacco": "Nicotiana tabacum",
+    "poplar": "Populus trichocarpa", "grape": "Vitis vinifera",
+    "peach": "Prunus persica", "apple": "Malus domestica",
+    "rapeseed": "Brassica napus", "turnip": "Brassica rapa",
+    "cotton": "Gossypium hirsutum", "orange": "Citrus sinensis",
+    "cassava": "Manihot esculenta", "common bean": "Phaseolus vulgaris",
+    "alfalfa": "Medicago truncatula", "chickpea": "Cicer arietinum",
+    "lotus": "Lotus japonicus", "pepper": "Capsicum annuum",
+    "melon": "Cucumis melo", "strawberry": "Fragaria vesca",
+    "banana": "Musa acuminata", "papaya": "Carica papaya",
+    "pine": "Pinus taeda", "Arabidopsis lyrata": "Arabidopsis lyrata",
+}
+
+
+def _lookup_ricedata(gene):
+    """Query ricedata.cn for a rice gene. Returns dict or None."""
+    url = f"{RICEDATA_URL}?para={urllib.parse.quote(gene)}"
+    try:
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", "Mozilla/5.0")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("gb2312", errors="replace")
+    except Exception:
+        return None
+
+    # Parse the TBResult table
+    table_m = re.search(r"<TABLE[^>]*id='TBResult'[^>]*>(.*?)</TABLE>", html, re.DOTALL)
+    if not table_m:
+        return None
+
+    rows = re.findall(r"<tr[^>]*>(.*?)</tr>", table_m.group(1), re.DOTALL | re.IGNORECASE)
+    all_cells = []
+    for row_html in rows:
+        cells = re.findall(r"<td[^>]*>(.*?)</td>", row_html, re.DOTALL | re.IGNORECASE)
+        cells = [re.sub(r"<[^>]+>", "", c).strip() for c in cells]
+        cells = [re.sub(r"&nbsp;", " ", c).strip() for c in cells]
+        all_cells.append(cells)
+
+    # Filter header rows, find data row
+    skip = ("GeneID", "基因名称", "基因符号", "RAP", "共")
+    for cells in all_cells:
+        if len(cells) >= 4 and cells[0] and not any(cells[0].startswith(w) for w in skip):
+            # Extract first word from RAP/MSU cells (strip ad text)
+            def _first(cell):
+                m = re.match(r"^(\S+)", cell)
+                return m.group(1) if m else cell
+            return {
+                "RAP": _first(cells[3]) if len(cells) > 3 else "",
+                "MSU": _first(cells[4]) if len(cells) > 4 else "",
+                "NCBI": _first(cells[5]) if len(cells) > 5 else "",
+            }
+    return None
+
+
+def _lookup_ncbi(species, gene):
+    """Query NCBI E-utils for a gene's Entrez ID. Returns Entrez ID or None."""
+    org = _NCBI_ORGANISM.get(species, species)
+    query = f"{gene}[Gene] AND {org}[Organism]"
+    params = {"db": "gene", "term": query, "retmode": "json", "retmax": 3}
+    url = NCBI_ESEARCH + "?" + urllib.parse.urlencode(params)
+
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = __import__("json").loads(resp.read().decode("utf-8"))
+        ids = data.get("esearchresult", {}).get("idlist", [])
+        return ids[0] if ids else None
+    except Exception:
+        return None
+
+
+def resolve_gene_ids(pairs_after):
+    """
+    Resolve gene IDs for all unique genes in deduped pairs.
+    Rice → ricedata.cn, others → NCBI E-utils.
+    Returns dict {(species, gene_norm): {RAP, MSU, NCBI}}.
+    """
+    # Collect unique (species, gene) from deduped results
+    unique = set()
+    for p in pairs_after:
+        sp = p.get("species", "unknown")
+        gn = p["gene_norm"]
+        if sp != "unknown":
+            unique.add((sp, gn))
+
+    genes_list = sorted(unique)
+    total = len(genes_list)
+    mapping = {}
+    resolved = 0
+
+    print(f"\n[INFO] Resolving gene IDs for {total} unique genes...")
+    rice_count = sum(1 for sp, _ in genes_list if sp == "rice")
+    print(f"   Rice (ricedata.cn): {rice_count}  |  Others (NCBI E-utils): {total - rice_count}\n")
+
+    for i, (sp, gn) in enumerate(genes_list):
+        if sp == "rice":
+            info = _lookup_ricedata(gn)
+            if info:
+                mapping[(sp, gn)] = info
+                resolved += 1
+                print(f"  [{i+1:4d}/{total}] + {gn:30s} RAP:{info.get('RAP',''):15s} NCBI:{info.get('NCBI','')}")
+            else:
+                mapping[(sp, gn)] = {"RAP": "", "MSU": "", "NCBI": ""}
+                print(f"  [{i+1:4d}/{total}] - {gn:30s} not in ricedata.cn")
+            time.sleep(0.3)
+        else:
+            eid = _lookup_ncbi(sp, gn)
+            if eid:
+                mapping[(sp, gn)] = {"RAP": "", "MSU": "", "NCBI": eid}
+                resolved += 1
+                print(f"  [{i+1:4d}/{total}] + {gn:30s} NCBI:{eid}")
+            else:
+                mapping[(sp, gn)] = {"RAP": "", "MSU": "", "NCBI": ""}
+                print(f"  [{i+1:4d}/{total}] - {gn:30s} not found in NCBI Gene")
+            time.sleep(0.4)
+
+    print(f"\n[INFO] Gene ID resolution: {resolved}/{total} ({resolved/total*100:.1f}%)")
+    return mapping
+
+
+# ============================================================
 # Excel output
 # ============================================================
 HEADER_FONT = Font(name='Consolas', bold=True, size=11, color='FFFFFF')
@@ -406,12 +540,12 @@ THIN_BORDER = Border(
 )
 
 
-def export_excel(pairs_before, pairs_after, output_path):
+def export_excel(pairs_before, pairs_after, gene_map, gene_resolved, gene_total, input_file, output_path):
     """
     Output three sheets:
-      Sheet 1: Normalized & deduplicated pairs
-      Sheet 2: Normalized but not deduplicated (preserves per-sentence granularity)
-      Sheet 3: Statistics overview
+      Sheet 1: Normalized & deduplicated pairs (with gene IDs)
+      Sheet 2: Normalized detail (per-sentence granularity)
+      Sheet 3: Statistics (extraction → review → normalization → gene IDs)
     """
     wb = openpyxl.Workbook()
 
@@ -421,8 +555,9 @@ def export_excel(pairs_before, pairs_after, output_path):
     ws1 = wb.active
     ws1.title = "Normalized-Deduped"
 
-    headers1 = ["#", "Normalized miRNA", "Gene", "Species", "PMID Count",
-                "Relation Type", "Source Sentences (merged)", "Article Titles", "PMIDs", "DOIs"]
+    headers1 = ["#", "Normalized miRNA", "Gene", "Species", "RAP_ID", "MSU_ID",
+                "NCBI_GeneID", "PMID Count", "Relation Type",
+                "Source Sentences (merged)", "Article Titles", "PMIDs", "DOIs"]
     for col, h in enumerate(headers1, 1):
         cell = ws1.cell(row=1, column=col, value=h)
         cell.font = HEADER_FONT
@@ -432,17 +567,22 @@ def export_excel(pairs_before, pairs_after, output_path):
 
     for i, p in enumerate(pairs_after):
         row = i + 2
-        vals = [i + 1, p["mirna"], p["gene"], p.get("species", "unknown"), p["pmid_count"],
-                p["relation"], p["sentences"], p["titles"], p["pmids"], p["dois"]]
+        sp = p.get("species", "unknown")
+        gn = p.get("gene_norm", p["gene"])
+        gmap = gene_map.get((sp, gn), {})
+        vals = [i + 1, p["mirna"], p["gene"], p.get("species", "unknown"),
+                gmap.get("RAP", ""), gmap.get("MSU", ""), gmap.get("NCBI", ""),
+                p["pmid_count"], p["relation"],
+                p["sentences"], p["titles"], p["pmids"], p["dois"]]
         for col, v in enumerate(vals, 1):
             cell = ws1.cell(row=row, column=col, value=v)
             cell.font = NORMAL_FONT
-            cell.alignment = WRAP_ALIGNMENT if col in (6, 7) else CENTER_ALIGNMENT
+            cell.alignment = WRAP_ALIGNMENT if col in (10, 11) else CENTER_ALIGNMENT
             cell.border = THIN_BORDER
             if p["pmid_count"] >= 2:
-                cell.fill = LIGHT_BLUE_FILL  # multi-PMID support → highlight
+                cell.fill = LIGHT_BLUE_FILL
 
-    col_widths1 = [6, 22, 22, 12, 8, 12, 70, 50, 20, 30]
+    col_widths1 = [6, 22, 22, 12, 16, 16, 14, 8, 12, 70, 50, 20, 30]
     for col, w in enumerate(col_widths1, 1):
         ws1.column_dimensions[get_column_letter(col)].width = w
     ws1.freeze_panes = 'A2'
@@ -487,52 +627,81 @@ def export_excel(pairs_before, pairs_after, output_path):
     ws2.auto_filter.ref = f"A1:{get_column_letter(len(headers2))}{len(pairs_before) + 1}"
 
     # ========================
-    # Sheet 3: Statistics overview
+    # Sheet 3: Statistics (all stages)
     # ========================
     ws3 = wb.create_sheet("Statistics")
 
-    title_cell = ws3.cell(row=1, column=1, value="miRNA Normalization Statistics")
+    bold12 = Font(name='Consolas', bold=True, size=12, color='2F5496')
+    bold11 = Font(name='Consolas', bold=True, size=11)
+
+    title_cell = ws3.cell(row=1, column=1, value="Pipeline Statistics — All Stages")
     title_cell.font = Font(name='Consolas', bold=True, size=14, color='2F5496')
     ws3.merge_cells('A1:C1')
 
-    # Normalization stats
-    m_changed_count = sum(1 for p in pairs_before if p["mirna_raw"] != p["mirna_norm"])
+    # Copy extraction + review stats from the input file's Statistics sheet
+    row = 3
+    try:
+        src_wb = openpyxl.load_workbook(input_file)
+        if 'Statistics' in src_wb.sheetnames:
+            src_ws = src_wb['Statistics']
+            for src_row in src_ws.iter_rows(min_row=1, max_row=src_ws.max_row, values_only=True):
+                vals = [str(c) if c is not None else "" for c in src_row]
+                if any(v for v in vals):
+                    for col, v in enumerate(vals[:3], 1):
+                        cell = ws3.cell(row=row, column=col, value=v)
+                        if row <= 3 or str(v).startswith("---") or str(v).startswith("["):
+                            cell.font = bold12 if str(v).startswith("---") or str(v).startswith("[") else bold11
+                        else:
+                            cell.font = NORMAL_FONT
+                    row += 1
+        src_wb.close()
+    except Exception:
+        pass
+
+    row += 1
+
+    # Normalization + Dedup stats
+    m_changed = sum(1 for p in pairs_before if p["mirna_raw"] != p["mirna_norm"])
     unique_m_before = len(set(p["mirna_raw"] for p in pairs_before))
     unique_m_after = len(set(p["mirna_norm"] for p in pairs_before))
 
-    stats = [
-        ("", "", ""),
-        ("[Normalization]", "", ""),
+    now_stats = [
+        ("--- Normalization & Dedup ---", "", ""),
         ("Pairs (before normalization)", len(pairs_before), ""),
-        ("  miRNA names changed", m_changed_count,
-         f"{m_changed_count/len(pairs_before)*100:.1f}%" if pairs_before else ""),
+        ("  miRNA names changed", m_changed,
+         f"{m_changed/len(pairs_before)*100:.1f}%" if pairs_before else ""),
         ("  Gene names — preserved as-is", "", ""),
-        ("", "", ""),
         ("Unique miRNAs (before)", unique_m_before, f"→ {unique_m_after} (after)"),
         ("", "", ""),
-        ("[Deduplication]", "", ""),
-        ("Pairs (before dedup)", len(pairs_before), ""),
-        ("Pair groups (after dedup)", len(pairs_after),
+        ("Pair groups (after dedup, before ID resolution)", len(pairs_after),
          f"Merged {len(pairs_before)-len(pairs_after)} entries"),
+        ("Multi-PMID support (>=2)", sum(1 for p in pairs_after if p["pmid_count"] >= 2), ""),
+        ("", "", ""),
+        ("--- Gene ID Resolution ---", "", ""),
+        ("Unique genes queried", gene_total, ""),
+        ("Resolved (RAP/MSU/NCBI)", gene_resolved, f"{gene_resolved/gene_total*100:.1f}%" if gene_total else ""),
+        ("Unresolved", gene_total - gene_resolved, ""),
     ]
 
-    for i, (label, val1, val2) in enumerate(stats):
-        row = i + 3
-        if label.startswith("["):
-            ws3.cell(row=row, column=1, value=label).font = Font(name='Consolas', bold=True, size=12, color='2F5496')
+    for label, val1, val2 in now_stats:
+        if label.startswith("---"):
+            ws3.cell(row=row, column=1, value=label).font = bold12
         elif label == "":
             pass
         else:
-            ws3.cell(row=row, column=1, value=label).font = Font(name='Consolas', bold=bool(val1), size=11)
+            ws3.cell(row=row, column=1, value=label).font = NORMAL_FONT
         if val1 != "":
             ws3.cell(row=row, column=2, value=val1).font = NORMAL_FONT
         if val2 != "":
             ws3.cell(row=row, column=3, value=val2).font = NORMAL_FONT
+        row += 1
 
-    ws3.column_dimensions['A'].width = 38
+    ws3.column_dimensions['A'].width = 42
     ws3.column_dimensions['B'].width = 18
     ws3.column_dimensions['C'].width = 28
 
+    if os.path.exists(output_path):
+        os.remove(output_path)
     wb.save(output_path)
     wb.close()
     print(f"   Excel saved to: {output_path}")
@@ -594,9 +763,14 @@ def main(input_file=None):
     if multi_pmid:
         print(f"   {multi_pmid} groups with >=2 PMID support")
 
-    # 4. Output Excel
+    # 4. Resolve gene IDs (rice → ricedata.cn, others → NCBI)
+    gene_map = resolve_gene_ids(deduped)
+    gene_total = len(gene_map)
+    gene_resolved = sum(1 for v in gene_map.values() if v.get("RAP") or v.get("NCBI"))
+
+    # 5. Output Excel
     print(f"\n[INFO] Generating Excel...")
-    export_excel(pairs, deduped, output_path)
+    export_excel(pairs, deduped, gene_map, gene_resolved, gene_total, fpath, output_path)
 
     # 5. Print examples for review
     print(f"\n{'='*60}")
