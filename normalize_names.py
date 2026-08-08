@@ -453,27 +453,51 @@ def _lookup_ricedata(gene):
 
 
 def _lookup_ncbi(species, gene):
-    """Query NCBI E-utils for a gene's Entrez ID. Returns Entrez ID or None."""
+    """Query NCBI E-utils. Returns Entrez ID or None."""
     org = _NCBI_ORGANISM.get(species, species)
-    query = f"{gene}[Gene] AND {org}[Organism]"
-    params = {"db": "gene", "term": query, "retmode": "json", "retmax": 3}
-    url = NCBI_ESEARCH + "?" + urllib.parse.urlencode(params)
 
-    try:
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = __import__("json").loads(resp.read().decode("utf-8"))
-        ids = data.get("esearchresult", {}).get("idlist", [])
-        return ids[0] if ids else None
-    except Exception:
-        return None
+    # Try full name first, then without species prefix (still species-filtered)
+    queries = [gene]
+    prefix = _NCBI_GENE_PREFIX.get(species, "")
+    if prefix and gene.startswith(prefix) and len(gene) > len(prefix) + 1:
+        queries.append(gene[len(prefix):])
+
+    for q in queries:
+        query = f"{q}[Gene] AND {org}[Organism]"
+        params = {"db": "gene", "term": query, "retmode": "json", "retmax": 3}
+        url = NCBI_ESEARCH + "?" + urllib.parse.urlencode(params)
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = __import__("json").loads(resp.read().decode("utf-8"))
+            ids = data.get("esearchresult", {}).get("idlist", [])
+            if ids:
+                return ids[0]
+        except Exception:
+            pass
+    return None
 
 
-def resolve_gene_ids(pairs_after):
+# Gene prefix to strip for NCBI fallback queries
+_NCBI_GENE_PREFIX = {
+    "rice": "Os", "wheat": "Ta", "maize": "Zm", "Arabidopsis": "At",
+    "soybean": "Gm", "barley": "Hvu", "sorghum": "Sbi", "tomato": "Sly",
+    "potato": "Stu", "tobacco": "Nta", "poplar": "Ptc", "peach": "Ppe",
+    "apple": "Mdm", "grape": "Vvi", "rapeseed": "Bna", "turnip": "Bra",
+    "cotton": "Gh", "orange": "Csi", "cassava": "Mes",
+    "common bean": "Pv", "alfalfa": "Mt", "chickpea": "Cas",
+    "lotus": "Lj", "pepper": "Ca", "melon": "Cm", "strawberry": "Fv",
+    "banana": "Ma", "papaya": "Cp", "pine": "Pt",
+    "Arabidopsis lyrata": "Al",
+}
+
+
+def resolve_gene_ids(pairs_after, progress_cb=None):
     """
     Resolve gene IDs for all unique genes in deduped pairs.
     Rice → ricedata.cn, others → NCBI E-utils.
     Returns dict {(species, gene_norm): {RAP, MSU, NCBI}}.
+    If progress_cb(ratio, text) is provided, it's called after each gene.
     """
     # Collect unique (species, gene) from deduped results
     unique = set()
@@ -493,6 +517,8 @@ def resolve_gene_ids(pairs_after):
     print(f"   Rice (ricedata.cn): {rice_count}  |  Others (NCBI E-utils): {total - rice_count}\n")
 
     for i, (sp, gn) in enumerate(genes_list):
+        if progress_cb:
+            progress_cb((i + 1) / total, f"Resolving gene IDs ({i + 1}/{total})")
         if sp == "rice":
             info = _lookup_ricedata(gn)
             if info:

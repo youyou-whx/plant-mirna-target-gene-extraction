@@ -321,16 +321,19 @@ if run_norm and input_for_norm:
 
         deduped = norm.deduplicate(pairs)
 
-    with st.spinner("Resolving gene IDs (ricedata.cn / NCBI)..."):
-        gene_map = {}
-        gene_resolved = 0
-        gene_total = 0
-        try:
-            gene_map = norm.resolve_gene_ids(deduped)
-            gene_total = len(gene_map)
-            gene_resolved = sum(1 for v in gene_map.values() if v.get("RAP") or v.get("NCBI"))
-        except Exception:
-            st.warning("Gene ID resolution failed (network issue). IDs will be empty.")
+    gene_map = {}
+    gene_resolved = 0
+    gene_total = 0
+    try:
+        prog = st.progress(0, "Resolving gene IDs...")
+        def _update_prog(ratio, text):
+            prog.progress(ratio, text)
+        gene_map = norm.resolve_gene_ids(deduped, progress_cb=_update_prog)
+        gene_total = len(gene_map)
+        gene_resolved = sum(1 for v in gene_map.values() if v.get("RAP") or v.get("NCBI"))
+        prog.progress(1.0, f"Done — {gene_resolved}/{gene_total} resolved")
+    except Exception:
+        st.warning("Gene ID resolution failed (network issue). IDs will be empty.")
 
     output_path = os.path.join(SCRIPT_DIR, "miRNA-Target_Gene_Pairs_Final.xlsx")
     norm.export_excel(pairs, deduped, gene_map, gene_resolved, gene_total, input_for_norm, output_path)
