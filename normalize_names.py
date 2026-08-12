@@ -8,6 +8,7 @@ Usage:
     python normalize_names.py [input_file.xlsx]
 """
 
+import json
 import re
 import sys
 import os
@@ -436,19 +437,33 @@ def _lookup_ricedata(gene):
         cells = [re.sub(r"&nbsp;", " ", c).strip() for c in cells]
         all_cells.append(cells)
 
-    # Filter header rows, find data row
+    # Find header row to map column names → indices
+    col_map = {}
+    for cells in all_cells:
+        if len(cells) >= 4 and cells[0] == "GeneID":
+            for idx, c in enumerate(cells):
+                c_clean = re.sub(r"<[^>]+>", "", c).strip()
+                if "RAP" in c_clean:
+                    col_map["RAP"] = idx
+                elif "MSU" in c_clean:
+                    col_map["MSU"] = idx
+                elif "NCBI" in c_clean:
+                    col_map["NCBI"] = idx
+            break
+
+    def _first(cell):
+        m = re.match(r"^(\S+)", cell)
+        return m.group(1) if m else cell
+
     skip = ("GeneID", "基因名称", "基因符号", "RAP", "共")
     for cells in all_cells:
         if len(cells) >= 4 and cells[0] and not any(cells[0].startswith(w) for w in skip):
-            # Extract first word from RAP/MSU cells (strip ad text)
-            def _first(cell):
-                m = re.match(r"^(\S+)", cell)
-                return m.group(1) if m else cell
-            return {
-                "RAP": _first(cells[3]) if len(cells) > 3 else "",
-                "MSU": _first(cells[4]) if len(cells) > 4 else "",
-                "NCBI": _first(cells[5]) if len(cells) > 5 else "",
-            }
+            rap = _first(cells[col_map.get("RAP", 3)]) if col_map.get("RAP") is not None and len(cells) > col_map["RAP"] else ""
+            msu = _first(cells[col_map.get("MSU", 4)]) if col_map.get("MSU") is not None and len(cells) > col_map["MSU"] else ""
+            ncbi = _first(cells[col_map.get("NCBI", 5)]) if col_map.get("NCBI") is not None and len(cells) > col_map["NCBI"] else ""
+            if ncbi and not re.match(r'^(LOC_?\d+|XM_|NM_|NP_|XR_|\d+)', ncbi):
+                ncbi = ""
+            return {"RAP": rap, "MSU": msu, "NCBI": ncbi}
     return None
 
 
@@ -469,7 +484,7 @@ def _lookup_ncbi(species, gene):
         try:
             req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=15) as resp:
-                data = __import__("json").loads(resp.read().decode("utf-8"))
+                data = json.loads(resp.read().decode("utf-8"))
             ids = data.get("esearchresult", {}).get("idlist", [])
             if ids:
                 return ids[0]
