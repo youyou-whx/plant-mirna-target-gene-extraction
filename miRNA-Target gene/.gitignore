@@ -12,5 +12,3 @@
 !requirements.txt
 !.streamlit/
 !.streamlit/config.toml
-!miRNA-Target gene/
-!miRNA-Target gene/**
